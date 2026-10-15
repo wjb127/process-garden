@@ -6,6 +6,9 @@ use std::{
     time::Duration,
 };
 use sysinfo::{Pid, ProcessesToUpdate, Signal, System};
+mod city;
+mod metrics;
+mod night;
 
 #[derive(Clone, Debug)]
 struct Row {
@@ -27,6 +30,8 @@ struct Snapshot {
     total: u64,
     used: u64,
     swap: u64,
+    cpu: Option<f32>,
+    disks: Vec<metrics::Disk>,
 }
 enum Request {
     Terminate(Vec<Row>),
@@ -52,10 +57,64 @@ fn role(name: &str, args: &str) -> String {
         "브라우저"
     } else if name.contains("qemu") || name.contains("VirtualMachine") {
         "가상 기기"
+    } else if ["zsh", "bash", "fish", "login", "tmux", "cmux", "sleep"].contains(&name) {
+        "터미널·대기"
+    } else if name.contains("ComputerUse") || name.contains("node_repl") || name == "aside" {
+        "자동화 도구"
+    } else if name.starts_with("com.apple.WebKit") {
+        "웹 콘텐츠"
+    } else if name.contains("mdworker") || name.contains("mds") || name.contains("Spotlight") {
+        "검색·인덱싱"
+    } else if name.contains("python") || name == "cargo" || name == "rustc" || name == "npm" {
+        "개발 도구"
     } else {
         "기타"
     }
     .into()
+}
+fn district(r: &Row) -> String {
+    if !r.project.is_empty() {
+        return r.project.clone();
+    }
+    if let Some((prefix, _)) = r.exe.split_once(".app/") {
+        return format!("앱 / {}", prefix.rsplit('/').next().unwrap_or(&r.name));
+    }
+    if r.exe.starts_with("/System/")
+        || r.exe.starts_with("/usr/libexec/")
+        || r.exe.starts_with("/usr/sbin/")
+    {
+        return format!("macOS / {}", r.name);
+    }
+    format!(
+        "{} / {}",
+        if r.role == "기타" {
+            "기타 앱"
+        } else {
+            &r.role
+        },
+        r.name
+    )
+}
+fn classify(name: &str, args: &str, exe: &str) -> String {
+    let base = role(name, args);
+    if base != "기타" {
+        return base;
+    }
+    if exe.starts_with("/System/")
+        || exe.starts_with("/usr/libexec/")
+        || exe.starts_with("/usr/sbin/")
+    {
+        "시스템 서비스".into()
+    } else if exe.contains(".app/") {
+        "일반 앱".into()
+    } else {
+        base
+    }
+}
+fn in_scope(r: &Row, scope: &[(String, Vec<Row>)]) -> bool {
+    scope
+        .last()
+        .is_none_or(|(_, rows)| rows.iter().any(|s| same_identity(r, s)))
 }
 fn project(text: &str) -> String {
     text.split("/Project/")
@@ -83,12 +142,14 @@ fn rows(system: &System) -> Vec<Row> {
             } else {
                 proj
             };
+            let exe = p.exe().map(|p| p.display().to_string()).unwrap_or_default();
+            let role = classify(&name, &args, &exe);
             Row {
                 pid: p.pid().as_u32(),
                 parent: p.parent().map(|p| p.as_u32()).unwrap_or(0),
                 start: p.start_time(),
-                exe: p.exe().map(|p| p.display().to_string()).unwrap_or_default(),
-                role: role(&name, &args),
+                exe,
+                role,
                 name,
                 project: proj,
                 memory: p.memory(),
@@ -171,20 +232,36 @@ fn terminate(target: &Row) -> Result<String, String> {
 }
 fn worker(tx: mpsc::Sender<Event>, rx: mpsc::Receiver<Request>) {
     let mut s = System::new_all();
+    let mut disks = sysinfo::Disks::new_with_refreshed_list();
+    let mut cpu_ready = false;
     loop {
         s.refresh_processes(ProcessesToUpdate::All, true);
         s.refresh_memory();
+        s.refresh_cpu_usage();
+        disks.refresh(true);
         if tx
             .send(Event::Snapshot(Snapshot {
                 rows: rows(&s),
                 total: s.total_memory(),
                 used: s.used_memory(),
                 swap: s.used_swap(),
+                cpu: cpu_ready.then(|| s.global_cpu_usage()),
+                disks: disks
+                    .list()
+                    .iter()
+                    .map(|d| metrics::Disk {
+                        name: d.name().to_string_lossy().into(),
+                        mount: d.mount_point().display().to_string(),
+                        total: d.total_space(),
+                        free: d.available_space(),
+                    })
+                    .collect(),
             }))
             .is_err()
         {
             break;
         }
+        cpu_ready = true;
         match rx.recv_timeout(Duration::from_secs(3)) {
             Ok(Request::Terminate(targets)) => {
                 let msg = targets
@@ -203,6 +280,12 @@ fn worker(tx: mpsc::Sender<Event>, rx: mpsc::Receiver<Request>) {
         }
     }
 }
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Tab {
+    Processes,
+    Disks,
+    History,
+}
 struct App {
     snapshot: Snapshot,
     rx: mpsc::Receiver<Event>,
@@ -217,6 +300,12 @@ struct App {
     message: String,
     sort: Sort,
     charts: bool,
+    city: bool,
+    buildings: bool,
+    city_layout: city::LayoutCache,
+    metrics: metrics::History,
+    tab: Tab,
+    scope: Vec<(String, Vec<Row>)>,
     group_project: bool,
 }
 impl App {
@@ -233,7 +322,14 @@ impl App {
                 .insert(0, "korean".into());
             cc.egui_ctx.set_fonts(fonts);
         }
-        cc.egui_ctx.set_visuals(egui::Visuals::light());
+        cc.egui_ctx.set_theme(egui::Theme::Dark);
+        let mut visuals = egui::Visuals::dark();
+        visuals.panel_fill = egui::Color32::from_rgb(13, 21, 34);
+        visuals.window_fill = egui::Color32::from_rgb(18, 29, 45);
+        visuals.extreme_bg_color = egui::Color32::from_rgb(8, 15, 26);
+        visuals.selection.bg_fill = egui::Color32::from_rgb(24, 94, 112);
+        visuals.override_text_color = Some(egui::Color32::from_rgb(216, 229, 240));
+        cc.egui_ctx.set_visuals(visuals);
         let mut style = (*cc.egui_ctx.style()).clone();
         style.spacing.item_spacing = egui::vec2(10., 9.);
         style
@@ -257,6 +353,12 @@ impl App {
             message: "프로세스를 불러오는 중…".into(),
             sort: Sort::Memory,
             charts: true,
+            city: true,
+            buildings: true,
+            city_layout: city::LayoutCache::default(),
+            metrics: metrics::History::default(),
+            tab: Tab::Processes,
+            scope: vec![],
             group_project: true,
         }
     }
@@ -336,6 +438,7 @@ impl eframe::App for App {
         while let Ok(e) = self.rx.try_recv() {
             match e {
                 Event::Snapshot(s) => {
+                    self.metrics.record(&s, metrics::now());
                     self.history
                         .push_back(s.used as f32 / s.total.max(1) as f32);
                     if self.history.len() > 60 {
@@ -348,7 +451,10 @@ impl eframe::App for App {
                         self.message = "3초마다 갱신 · 메모리는 현재 RSS 기준".into()
                     }
                 }
-                Event::Message(m) => self.message = m,
+                Event::Message(m) => {
+                    self.metrics.mark(metrics::now());
+                    self.message = m;
+                }
             }
         }
         ctx.request_repaint_after(Duration::from_millis(500));
@@ -385,44 +491,56 @@ impl eframe::App for App {
                 .desired_height(5.),
             );
             ui.add_space(5.);
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut self.tab, Tab::Processes, "프로세스");
+                ui.selectable_value(&mut self.tab, Tab::Disks, "디스크");
+                ui.selectable_value(&mut self.tab, Tab::History, "최근 1시간");
+            });
         });
         egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
             egui::ScrollArea::vertical().max_height(70.).show(ui, |ui| {
                 ui.label(&self.message);
             });
         });
-        egui::SidePanel::left("filters")
-            .exact_width(140.)
-            .show(ctx, |ui| {
-                ui.add_space(10.);
-                ui.strong("분류");
-                for category in [
-                    "전체",
-                    "에이전트",
-                    "MCP 도구",
-                    "개발 도구",
-                    "브라우저",
-                    "가상 기기",
-                    "기타",
-                ] {
-                    let count = self
-                        .snapshot
-                        .rows
-                        .iter()
-                        .filter(|r| category == "전체" || r.role == category)
-                        .count();
-                    ui.selectable_value(
-                        &mut self.filter,
-                        category.into(),
-                        format!("{category}  {count}"),
-                    );
-                }
-                ui.separator();
-                ui.label("이름·PID·프로젝트로 검색");
-                ui.add_space(10.);
-                ui.small("부모가 1이어도 상시 서비스일 수 있어.");
-            });
-        egui::SidePanel::right("inspector").exact_width(270.).show(ctx,|ui|{
+        if self.tab == Tab::Processes {
+            egui::SidePanel::left("filters")
+                .exact_width(140.)
+                .show(ctx, |ui| {
+                    ui.add_space(10.);
+                    ui.strong("분류");
+                    for category in [
+                        "전체",
+                        "에이전트",
+                        "MCP 도구",
+                        "개발 도구",
+                        "브라우저",
+                        "가상 기기",
+                        "터미널·대기",
+                        "자동화 도구",
+                        "웹 콘텐츠",
+                        "검색·인덱싱",
+                        "시스템 서비스",
+                        "일반 앱",
+                        "기타",
+                    ] {
+                        let count = self
+                            .snapshot
+                            .rows
+                            .iter()
+                            .filter(|r| category == "전체" || r.role == category)
+                            .count();
+                        ui.selectable_value(
+                            &mut self.filter,
+                            category.into(),
+                            format!("{category}  {count}"),
+                        );
+                    }
+                    ui.separator();
+                    ui.label("이름·PID·프로젝트로 검색");
+                    ui.add_space(10.);
+                    ui.small("부모가 1이어도 상시 서비스일 수 있어.");
+                });
+            egui::SidePanel::right("inspector").exact_width(270.).show(ctx,|ui|{
         ui.add_space(10.);ui.heading("프로세스 상세");
         if let Some(selected)=self.selected.clone() {
             let live=self.snapshot.rows.iter().find(|r|same_identity(r,&selected)).cloned();
@@ -441,7 +559,18 @@ impl eframe::App for App {
             if live.is_none(){ui.label("종료됨 또는 조회 불가");}else if blocked{ui.label("시스템·다른 사용자·현재 앱은 보호돼.");}else{ui.small("종료 전 저장하지 않은 작업을 확인해 줘. 자식 프로세스는 함께 종료하지 않아.");}
         } else {ui.label("목록에서 프로세스를 선택해 줘.");}
     });
+        }
         egui::CentralPanel::default().show(ctx, |ui| {
+            if self.tab != Tab::Processes {
+                egui::ScrollArea::vertical()
+                    .id_salt("resource_tab")
+                    .show(ui, |ui| match self.tab {
+                        Tab::Disks => metrics::show_disks(ui, &self.snapshot),
+                        Tab::History => self.metrics.show(ui, &self.snapshot),
+                        Tab::Processes => {}
+                    });
+                return;
+            }
             ui.horizontal_wrapped(|ui| {
                 ui.add(
                     egui::TextEdit::singleline(&mut self.query)
@@ -463,22 +592,34 @@ impl eframe::App for App {
                     });
                 ui.checkbox(&mut self.group_project, "프로젝트별");
                 ui.checkbox(&mut self.charts, "차트");
+                ui.checkbox(&mut self.city, "도시 지도");
+                ui.checkbox(&mut self.buildings, "3D 건물");
             });
+            if !self.scope.is_empty() {
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button("← 이전 구역").clicked() {
+                        self.scope.pop();
+                    }
+                    if ui.button("전체 지도").clicked() {
+                        self.scope.clear();
+                    }
+                    if let Some((label, _)) = self.scope.last() {
+                        ui.label(format!("선택 구역: {label}"));
+                    }
+                });
+            }
             ui.separator();
             let q = self.query.to_lowercase();
             let mut groups: BTreeMap<String, Vec<Row>> = BTreeMap::new();
             for r in &self.snapshot.rows {
                 if (self.filter == "전체" || r.role == self.filter)
+                    && in_scope(r, &self.scope)
                     && format!("{} {} {}", r.name, r.pid, r.project)
                         .to_lowercase()
                         .contains(&q)
                 {
                     let group = if self.group_project {
-                        if r.project.is_empty() {
-                            "프로젝트 미확인 / 앱".into()
-                        } else {
-                            r.project.clone()
-                        }
+                        district(r)
                     } else {
                         "전체 목록".into()
                     };
@@ -519,9 +660,41 @@ impl eframe::App for App {
             if self.group_project {
                 ui.small("정렬은 각 프로젝트 안에 적용돼. 전체 정렬은 프로젝트별을 꺼 줘.");
             }
+            if self.city {
+                if let Some(area) = city::show(
+                    ui,
+                    &visible,
+                    self.selected.as_ref(),
+                    &self.checked,
+                    self.buildings,
+                    &mut self.city_layout,
+                    &format!(
+                        "{}|{}|{:?}",
+                        self.query,
+                        self.filter,
+                        self.scope.iter().map(|s| &s.0).collect::<Vec<_>>()
+                    ),
+                ) {
+                    if ui.input(|i| i.modifiers.command) && area.rows.len() == 1 {
+                        let r = &area.rows[0];
+                        if !protected(r, &guards) && self.checked.remove(&r.pid).is_none() {
+                            self.checked.insert(r.pid, r.clone());
+                        }
+                        self.selected = Some(r.clone());
+                    } else {
+                        self.selected = if area.rows.len() == 1 {
+                            area.rows.first().cloned()
+                        } else {
+                            None
+                        };
+                        self.scope.push((area.label, area.rows));
+                        ctx.request_repaint();
+                    }
+                }
+            }
             if self.charts {
                 egui::CollapsingHeader::new("리소스 차트")
-                    .default_open(true)
+                    .default_open(false)
                     .show(ui, |ui| {
                         ui.small("전체 RAM 사용률 · 최근 60개 표본 (약 3분)");
                         let (rect, _) = ui.allocate_exact_size(
@@ -529,7 +702,7 @@ impl eframe::App for App {
                             egui::Sense::hover(),
                         );
                         let painter = ui.painter_at(rect);
-                        painter.rect_filled(rect, 3., egui::Color32::from_gray(235));
+                        painter.rect_filled(rect, 3., egui::Color32::from_rgb(8, 18, 30));
                         let points: Vec<_> = self
                             .history
                             .iter()
@@ -582,105 +755,115 @@ impl eframe::App for App {
                         }
                     });
             }
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                for (group, entries) in groups {
-                    let mem: u64 = entries.iter().map(|r| r.memory).sum();
-                    egui::CollapsingHeader::new(format!(
-                        "{}  · {}개 · {:.0} MiB",
-                        group,
-                        entries.len(),
-                        mem as f64 / 1048576.
-                    ))
-                    .id_salt(&group)
-                    .default_open(true)
-                    .show(ui, |ui| {
-                        egui::Grid::new((&group, "grid"))
-                            .num_columns(6)
-                            .striped(true)
-                            .spacing([12., 8.])
-                            .show(ui, |ui| {
-                                ui.label("");
-                                ui.strong("프로세스 / PID");
-                                ui.strong("MiB");
-                                ui.strong("CPU");
-                                ui.strong("경과");
-                                ui.strong("중요도");
-                                ui.end_row();
-                                for r in entries {
-                                    let mut checked = self
-                                        .checked
-                                        .get(&r.pid)
-                                        .is_some_and(|x| same_identity(x, &r));
-                                    let response = ui.add_enabled(
-                                        !protected(&r, &guards),
-                                        egui::Checkbox::without_text(&mut checked),
-                                    );
-                                    if response.changed() {
-                                        if ui.input(|i| i.modifiers.shift) {
-                                            select_range(
-                                                &mut self.checked,
-                                                &visible,
-                                                self.anchor.unwrap_or(r.pid),
-                                                r.pid,
-                                                &guards,
-                                            );
-                                        } else if checked {
-                                            self.checked.insert(r.pid, r.clone());
-                                        } else {
-                                            self.checked.remove(&r.pid);
-                                        }
-                                        self.anchor = Some(r.pid);
-                                    }
-                                    let name = format!("{}  · {}", r.name, r.pid);
-                                    let is_selected = self
-                                        .selected
-                                        .as_ref()
-                                        .is_some_and(|s| same_identity(s, &r));
-                                    if ui
-                                        .add_sized(
-                                            [ui.available_width().min(220.).max(110.), 24.],
-                                            egui::Button::selectable(
-                                                is_selected,
-                                                egui::RichText::new(name),
-                                            )
-                                            .truncate(),
-                                        )
-                                        .on_hover_text(format!("{} · 부모 {}", r.role, r.parent))
-                                        .clicked()
-                                    {
-                                        if ui.input(|i| i.modifiers.shift) {
-                                            select_range(
-                                                &mut self.checked,
-                                                &visible,
-                                                self.anchor.unwrap_or(r.pid),
-                                                r.pid,
-                                                &guards,
-                                            );
-                                        } else if ui.input(|i| i.modifiers.command)
-                                            && !protected(&r, &guards)
-                                        {
-                                            if self.checked.remove(&r.pid).is_none() {
-                                                self.checked.insert(r.pid, r.clone());
-                                            }
-                                        }
-                                        self.anchor = Some(r.pid);
-                                        self.selected = Some(r.clone())
-                                    }
-                                    ui.label(format!("{:.1}", r.memory as f64 / 1048576.));
-                                    ui.label(format!("{:.1}%", r.cpu));
-                                    ui.label(format!(
-                                        "{}h {}m",
-                                        r.seconds / 3600,
-                                        r.seconds % 3600 / 60
-                                    ));
-                                    let (_, level, reason) = importance(&r, &guards);
-                                    ui.label(level).on_hover_text(reason);
+            egui::ScrollArea::vertical()
+                .id_salt(("process-list", self.scope.last().map(|s| s.0.clone())))
+                .show(ui, |ui| {
+                    for (group, entries) in groups {
+                        let mem: u64 = entries.iter().map(|r| r.memory).sum();
+                        egui::CollapsingHeader::new(format!(
+                            "{}  · {}개 · {:.0} MiB",
+                            group,
+                            entries.len(),
+                            mem as f64 / 1048576.
+                        ))
+                        .id_salt(&group)
+                        .default_open(true)
+                        .open(if self.scope.is_empty() {
+                            None
+                        } else {
+                            Some(true)
+                        })
+                        .show(ui, |ui| {
+                            egui::Grid::new((&group, "grid"))
+                                .num_columns(6)
+                                .striped(true)
+                                .spacing([12., 8.])
+                                .show(ui, |ui| {
+                                    ui.label("");
+                                    ui.strong("프로세스 / PID");
+                                    ui.strong("MiB");
+                                    ui.strong("CPU");
+                                    ui.strong("경과");
+                                    ui.strong("중요도");
                                     ui.end_row();
-                                }
-                            });
-                    });
-                }
-            });
+                                    for r in entries {
+                                        let mut checked = self
+                                            .checked
+                                            .get(&r.pid)
+                                            .is_some_and(|x| same_identity(x, &r));
+                                        let response = ui.add_enabled(
+                                            !protected(&r, &guards),
+                                            egui::Checkbox::without_text(&mut checked),
+                                        );
+                                        if response.changed() {
+                                            if ui.input(|i| i.modifiers.shift) {
+                                                select_range(
+                                                    &mut self.checked,
+                                                    &visible,
+                                                    self.anchor.unwrap_or(r.pid),
+                                                    r.pid,
+                                                    &guards,
+                                                );
+                                            } else if checked {
+                                                self.checked.insert(r.pid, r.clone());
+                                            } else {
+                                                self.checked.remove(&r.pid);
+                                            }
+                                            self.anchor = Some(r.pid);
+                                        }
+                                        let name = format!("{}  · {}", r.name, r.pid);
+                                        let is_selected = self
+                                            .selected
+                                            .as_ref()
+                                            .is_some_and(|s| same_identity(s, &r));
+                                        if ui
+                                            .add_sized(
+                                                [ui.available_width().min(220.).max(110.), 24.],
+                                                egui::Button::selectable(
+                                                    is_selected,
+                                                    egui::RichText::new(name),
+                                                )
+                                                .truncate(),
+                                            )
+                                            .on_hover_text(format!(
+                                                "{} · 부모 {}",
+                                                r.role, r.parent
+                                            ))
+                                            .clicked()
+                                        {
+                                            if ui.input(|i| i.modifiers.shift) {
+                                                select_range(
+                                                    &mut self.checked,
+                                                    &visible,
+                                                    self.anchor.unwrap_or(r.pid),
+                                                    r.pid,
+                                                    &guards,
+                                                );
+                                            } else if ui.input(|i| i.modifiers.command)
+                                                && !protected(&r, &guards)
+                                            {
+                                                if self.checked.remove(&r.pid).is_none() {
+                                                    self.checked.insert(r.pid, r.clone());
+                                                }
+                                            }
+                                            self.anchor = Some(r.pid);
+                                            self.selected = Some(r.clone())
+                                        }
+                                        ui.label(format!("{:.1}", r.memory as f64 / 1048576.));
+                                        ui.label(format!("{:.1}%", r.cpu));
+                                        ui.label(format!(
+                                            "{}h {}m",
+                                            r.seconds / 3600,
+                                            r.seconds % 3600 / 60
+                                        ));
+                                        let (_, level, reason) = importance(&r, &guards);
+                                        ui.label(level).on_hover_text(reason);
+                                        ui.end_row();
+                                    }
+                                });
+                        });
+                    }
+                });
         });
         if let Some(targets) = self.confirm.clone() {
             egui::Window::new("프로세스를 종료할까?")
@@ -789,6 +972,27 @@ mod tests {
     fn categories() {
         assert_eq!(role("codex", ""), "에이전트");
         assert_eq!(role("node", "mcp server"), "MCP 도구");
+        assert_eq!(role("zsh", ""), "터미널·대기");
+        assert_eq!(role("mdworker_shared", ""), "검색·인덱싱");
+        assert_eq!(
+            classify("distnoted", "", "/usr/sbin/distnoted"),
+            "시스템 서비스"
+        );
+        assert_eq!(
+            classify(
+                "Example",
+                "",
+                "/Applications/Example.app/Contents/MacOS/Example"
+            ),
+            "일반 앱"
+        );
+        let mut r = fixture(100, 123);
+        r.exe = "/Applications/Example.app/Contents/Helpers/Child.app/Contents/MacOS/Child".into();
+        assert_eq!(district(&r), "앱 / Example");
+        let scope = vec![("Example".into(), vec![r.clone()])];
+        assert!(in_scope(&r, &scope));
+        r.start += 1;
+        assert!(!in_scope(&r, &scope));
         assert_eq!(
             project("/Users/a/Project/ss-133-process-garden/src"),
             "ss-133-process-garden"
