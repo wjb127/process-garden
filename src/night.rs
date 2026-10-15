@@ -506,8 +506,9 @@ pub fn show(
         renderer.paint(&painter, canvas, pr.mesh.take());
     }
     for (point, name, old) in labels {
-        let title = if name.chars().count() > 16 {
-            format!("{}…", name.chars().take(14).collect::<String>())
+        let limit = ((120. * scale / 10.) as usize).clamp(3, 16);
+        let title = if name.chars().count() > limit {
+            format!("{}…", name.chars().take(limit - 1).collect::<String>())
         } else {
             name.clone()
         };

@@ -530,7 +530,11 @@ mod tests {
                 .iter()
                 .find_map(|s| {
                     if let Shape::Text(t) = &s.shape {
-                        if t.galley.job.text == "demo-district" {
+                        let title = &t.galley.job.text;
+                        if title == "demo-district"
+                            || (title.ends_with('…')
+                                && "demo-district".starts_with(title.trim_end_matches('…')))
+                        {
                             Some(t.pos + vec2(3., 3.))
                         } else {
                             None
