@@ -11,6 +11,7 @@ use std::{
 use sysinfo::Signal;
 use sysinfo::{Pid, ProcessesToUpdate, System};
 mod city;
+mod city_gpu;
 mod metrics;
 mod night;
 
@@ -444,7 +445,7 @@ impl App {
             charts: true,
             city: true,
             buildings: true,
-            city_layout: city::LayoutCache::default(),
+            city_layout: city::LayoutCache::new(cc.gl.as_deref()),
             metrics: metrics::History::default(),
             tab: Tab::Processes,
             scope: vec![],
@@ -527,6 +528,11 @@ fn select_range(
     }
 }
 impl eframe::App for App {
+    fn on_exit(&mut self, gl: Option<&eframe::glow::Context>) {
+        if let Some(gl) = gl {
+            self.city_layout.destroy(gl);
+        }
+    }
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
         while let Ok(e) = self.rx.try_recv() {
             match e {
@@ -1031,6 +1037,7 @@ fn main() -> eframe::Result {
         return Ok(());
     }
     let options = eframe::NativeOptions {
+        depth_buffer: 24,
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1180., 760.])
             .with_min_inner_size([1100., 700.]),

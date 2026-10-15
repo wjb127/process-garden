@@ -13,6 +13,21 @@ pub struct LayoutCache {
     camera: super::night::Camera,
 }
 impl LayoutCache {
+    pub fn new(gl: Option<&eframe::glow::Context>) -> Self {
+        let mut cache = Self::default();
+        if let Some(gl) = gl {
+            match super::city_gpu::Renderer::new(gl) {
+                Ok(renderer) => cache.camera.renderer = Some(std::sync::Arc::new(renderer)),
+                Err(error) => cache.camera.gpu_error = Some(error),
+            }
+        }
+        cache
+    }
+    pub fn destroy(&self, gl: &eframe::glow::Context) {
+        if let Some(r) = &self.camera.renderer {
+            r.destroy(gl);
+        }
+    }
     fn update(&mut self, key: &str, now: f64, rows: &[Row]) {
         if self.key != key
             || now - self.captured >= 300.

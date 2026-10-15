@@ -28,3 +28,19 @@ jobs:
       - name: Bundle macOS app
         if: runner.os == 'macOS'
         run: bash scripts/bundle.sh
+      - name: Package macOS
+        if: runner.os == 'macOS'
+        run: ditto -c -k --sequesterRsrc --keepParent 'dist/Process Garden.app' dist/Process-Garden-macOS.zip
+      - uses: actions/upload-artifact@v4
+        if: runner.os == 'macOS'
+        with:
+          name: Process-Garden-macOS
+          path: dist/Process-Garden-macOS.zip
+      - uses: actions/upload-artifact@v4
+        if: runner.os == 'Windows'
+        with:
+          name: Process-Garden-Windows
+          path: |
+            target/release/process-garden.exe
+            scripts/install-windows.ps1
+            WINDOWS.md

@@ -3,6 +3,8 @@ use eframe::egui::*;
 use std::collections::BTreeMap;
 
 pub struct Camera {
+    pub renderer: Option<std::sync::Arc<super::city_gpu::Renderer>>,
+    pub gpu_error: Option<String>,
     angle: f32,
     tilt: f32,
     zoom: f32,
@@ -10,35 +12,47 @@ pub struct Camera {
     edit: bool,
     offsets: BTreeMap<String, Vec2>,
     dragging: Option<String>,
+    rendered: [f32; 2],
 }
 impl Default for Camera {
     fn default() -> Self {
         Self {
-            angle: -0.52,
+            renderer: None,
+            gpu_error: None,
+            angle: 0.,
             tilt: 0.58,
             zoom: 1.,
             pan: Vec2::ZERO,
             edit: false,
             offsets: BTreeMap::new(),
             dragging: None,
+            rendered: [0., 0.58],
         }
     }
 }
 type V = [f32; 3];
 struct Projection {
+    mesh: std::cell::RefCell<Vec<f32>>,
+    canvas: Rect,
+    gpu: bool,
     center: Pos2,
     scale: f32,
     angle: f32,
     tilt: f32,
 }
 impl Projection {
+    fn distance(&self, p: V) -> f32 {
+        // 수평을 유지하는 궤도 카메라. 시야 앞쪽 물체에 원근감을 적용한다.
+        (2400. - self.depth(p) * self.tilt.cos() - p[1] * self.tilt.sin()).max(100.)
+    }
     fn point(&self, p: V) -> Pos2 {
         let (s, c) = self.angle.sin_cos();
+        let perspective = 2400. / self.distance(p);
         self.center
             + vec2(
                 (p[0] * c - p[2] * s) * self.scale,
                 ((p[0] * s + p[2] * c) * self.tilt.sin() - p[1] * self.tilt.cos()) * self.scale,
-            )
+            ) * perspective
     }
     fn depth(&self, p: V) -> f32 {
         p[0] * self.angle.sin() + p[2] * self.angle.cos()
@@ -63,7 +77,27 @@ fn contains(points: &[Pos2], p: Pos2) -> bool {
 }
 fn poly(p: &Painter, pr: &Projection, v: &[V], color: Color32) -> Vec<Pos2> {
     let points: Vec<_> = v.iter().map(|v| pr.point(*v)).collect();
-    p.add(Shape::convex_polygon(points.clone(), color, Stroke::NONE));
+    if pr.gpu {
+        let mut mesh = pr.mesh.borrow_mut();
+        for i in 1..v.len() - 1 {
+            for j in [0, i, i + 1] {
+                let point = points[j];
+                // 카메라 깊이를 전달하여 그리는 순서와 무관하게 앞면을 표시한다.
+                let depth = 1. - 200. / pr.distance(v[j]);
+                mesh.extend_from_slice(&[
+                    (point.x - pr.canvas.left()) / pr.canvas.width() * 2. - 1.,
+                    1. - (point.y - pr.canvas.top()) / pr.canvas.height() * 2.,
+                    depth,
+                    color.r() as f32 / 255.,
+                    color.g() as f32 / 255.,
+                    color.b() as f32 / 255.,
+                    color.a() as f32 / 255.,
+                ]);
+            }
+        }
+    } else {
+        p.add(Shape::convex_polygon(points.clone(), color, Stroke::NONE));
+    }
     points
 }
 fn rgb(r: u8, g: u8, b: u8) -> Color32 {
@@ -95,11 +129,24 @@ pub fn show(
         if ui.button("−").on_hover_text("축소").clicked() {
             camera.zoom = (camera.zoom / 1.2).max(0.4);
         }
-        if ui.button("↻ 회전").clicked() {
-            camera.angle += std::f32::consts::FRAC_PI_4;
+        if ui.button("◀ 회전").clicked() {
+            camera.angle -= std::f32::consts::FRAC_PI_2;
+        }
+        if ui.button("회전 ▶").clicked() {
+            camera.angle += std::f32::consts::FRAC_PI_2;
+        }
+        for (label, angle, tilt) in [
+            ("정면", 0., 0.35),
+            ("측면", std::f32::consts::FRAC_PI_2, 0.35),
+            ("위에서", 0., 1.48),
+        ] {
+            if ui.button(label).clicked() {
+                camera.angle = angle;
+                camera.tilt = tilt;
+            }
         }
         if ui.button("전체 보기").clicked() {
-            camera.angle = -0.52;
+            camera.angle = 0.;
             camera.tilt = 0.58;
             camera.zoom = 1.;
             camera.pan = Vec2::ZERO;
@@ -109,7 +156,21 @@ pub fn show(
             camera.offsets.clear();
         }
         ui.small(format!("{:.0}%", camera.zoom * 100.));
+        let mut degrees = camera.tilt.to_degrees();
+        if ui
+            .add(
+                Slider::new(&mut degrees, 15.0..=85.0)
+                    .suffix("°")
+                    .text("높낮이"),
+            )
+            .changed()
+        {
+            camera.tilt = degrees.to_radians();
+        }
     });
+    if camera.gpu_error.is_some() {
+        ui.colored_label(Color32::YELLOW, "GPU 초기화 실패 · 기본 지도 표시 중");
+    }
     ui.small("드래그 이동 · 휠 확대 · 우클릭 드래그 회전 · 건물/구역 클릭으로 목록 보기");
     let height = (ui.available_height() * 0.6).clamp(260., 460.);
     let (canvas, response) =
@@ -125,7 +186,14 @@ pub fn show(
     if response.dragged_by(PointerButton::Secondary) {
         let d = ui.input(|i| i.pointer.delta());
         camera.angle += d.x * 0.008;
-        camera.tilt = (camera.tilt + d.y * 0.005).clamp(0.25, 1.15);
+    }
+    let blend = 1. - (-12. * ui.input(|i| i.stable_dt).min(0.1)).exp();
+    let targets = [camera.angle, camera.tilt];
+    for (value, target) in camera.rendered.iter_mut().zip(targets) {
+        *value += (target - *value) * blend;
+        if (target - *value).abs() > 0.001 {
+            ui.ctx().request_repaint();
+        }
     }
     let mut groups: BTreeMap<String, Vec<Row>> = BTreeMap::new();
     for r in frozen.iter().filter(|r| r.memory > 0) {
@@ -160,14 +228,22 @@ pub fn show(
     let rows = groups.len().div_ceil(cols);
     let width = cols as f32 * 150.;
     let depth = rows as f32 * 170.;
-    let scale = (canvas.width() / (width + depth) * 1.05)
-        .min(canvas.height() / (depth * 0.65 + 180.))
+    let (s, c) = camera.rendered[0].sin_cos();
+    let projected_width = width * c.abs() + depth * s.abs();
+    let projected_depth = width * s.abs() + depth * c.abs();
+    let scale = (canvas.width() / (projected_width + 160.)).min(
+        canvas.height()
+            / (projected_depth * camera.rendered[1].sin() + 240. * camera.rendered[1].cos() + 120.),
+    ) * 0.8
         * camera.zoom;
     let pr = Projection {
+        mesh: Default::default(),
+        canvas,
+        gpu: camera.renderer.is_some(),
         center: canvas.center() + vec2(0., -15.) + camera.pan,
         scale,
-        angle: camera.angle,
-        tilt: camera.tilt,
+        angle: camera.rendered[0],
+        tilt: camera.rendered[1],
     };
     if response.dragged_by(PointerButton::Primary) {
         let d = ui.input(|i| i.pointer.delta());
@@ -358,6 +434,29 @@ pub fn show(
             let span = ((end[0] - a[0]).powi(2) + (end[2] - a[2]).powi(2)).sqrt();
             let ux = (end[0] - a[0]) / span;
             let uz = (end[2] - a[2]) / span;
+            // 노란 빛 띠를 바닥에서 지붕으로 반복 이동시킨다.
+            if !members.is_empty() && cpu > 0.1 {
+                let y = ((now as f32 * 0.18 + b.old[0].pid as f32 * 0.013).fract()) * h;
+                for (half, color) in [
+                    (3., Color32::from_rgba_unmultiplied(255, 204, 90, 35)),
+                    (0.65, rgb(255, 218, 124)),
+                ] {
+                    let low = (y - half).max(0.);
+                    let high = (y + half).min(h);
+                    let point = |t: f32, y: f32| [a[0] + ux * t, y, a[2] + uz * t];
+                    poly(
+                        &painter,
+                        &pr,
+                        &[
+                            point(0., low),
+                            point(span, low),
+                            point(span, high),
+                            point(0., high),
+                        ],
+                        color,
+                    );
+                }
+            }
             for floor in 0..(h / 10.) as usize {
                 for col in 0..3 {
                     let y = 5. + floor as f32 * 10.;
@@ -402,6 +501,9 @@ pub fn show(
             members,
             key: Some(b.key),
         });
+    }
+    if let Some(renderer) = &camera.renderer {
+        renderer.paint(&painter, canvas, pr.mesh.take());
     }
     for (point, name, old) in labels {
         let title = if name.chars().count() > 16 {
@@ -449,7 +551,7 @@ pub fn show(
         None
     };
     if let Some(h) = hover {
-        response.on_hover_text(format!(
+        response.clone().on_hover_text(format!(
             "{}\n{}개 프로세스 · RSS {:.1} MiB · CPU {:.1}%\n{}",
             h.name,
             h.members.len(),
@@ -474,7 +576,11 @@ pub fn show(
     ));
     if ui.input(|i| i.viewport().focused.unwrap_or(false)) {
         ui.ctx()
-            .request_repaint_after(std::time::Duration::from_millis(100));
+            .request_repaint_after(std::time::Duration::from_millis(if response.dragged() {
+                16
+            } else {
+                50
+            }));
     }
     clicked
 }
@@ -485,12 +591,18 @@ mod tests {
     #[test]
     fn polygon_hit_and_projection_rotation() {
         let p = Projection {
+            mesh: Default::default(),
+            canvas: Rect::EVERYTHING,
+            gpu: false,
             center: Pos2::ZERO,
             scale: 1.,
             angle: 0.,
             tilt: 0.5,
         };
         assert_eq!(p.point([10., 0., 0.]).x, 10.);
+        // 가까운 물체는 크게, 먼 물체는 작게 보이며 좌우 수평은 유지된다.
+        assert!(p.point([10., 0., 200.]).x > p.point([10., 0., -200.]).x);
+        assert_eq!(p.point([10., 0., 0.]).y, p.point([-10., 0., 0.]).y);
         let rotated = Projection {
             angle: std::f32::consts::FRAC_PI_2,
             ..p
