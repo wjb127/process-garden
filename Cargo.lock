@@ -1582,7 +1582,6 @@ name = "process-garden"
 version = "0.2.0"
 dependencies = [
  "eframe",
- "libc",
  "sysinfo",
 ]
 

@@ -1,3 +1,5 @@
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 use eframe::egui;
 use std::{
     collections::{BTreeMap, HashSet},
@@ -5,7 +7,9 @@ use std::{
     thread,
     time::Duration,
 };
-use sysinfo::{Pid, ProcessesToUpdate, Signal, System};
+#[cfg(unix)]
+use sysinfo::Signal;
+use sysinfo::{Pid, ProcessesToUpdate, System};
 
 #[derive(Clone, Debug)]
 struct Row {
@@ -26,6 +30,7 @@ struct Snapshot {
     rows: Vec<Row>,
     total: u64,
     used: u64,
+    available: u64,
     swap: u64,
 }
 enum Request {
@@ -37,20 +42,31 @@ enum Event {
 }
 
 fn role(name: &str, args: &str) -> String {
-    if name == "codex" || name == "claude" {
+    let lower = name.to_lowercase();
+    let name = lower.trim_end_matches(".exe");
+    let args = args.to_lowercase();
+    if ["codex", "claude", "chatgpt"].contains(&name) {
         "에이전트"
+    } else if ["ollama", "ollama app", "llama-server", "lm studio", "lms"].contains(&name) {
+        "로컬 LLM"
     } else if args.contains("mcp") || args.contains("modelcontextprotocol") {
         "MCP 도구"
-    } else if ["workerd", "esbuild", "node", "uv", "uvx", "bun"].contains(&name)
+    } else if [
+        "workerd", "esbuild", "node", "uv", "uvx", "bun", "python", "pythonw", "cargo", "rustc",
+    ]
+    .contains(&name)
         || args.contains("wrangler")
     {
         "개발 도구"
-    } else if ["Chrome", "Aside", "Safari", "Firefox"]
+    } else if ["chrome", "aside", "safari", "firefox", "msedge"]
         .iter()
         .any(|s| name.contains(s))
     {
         "브라우저"
-    } else if name.contains("qemu") || name.contains("VirtualMachine") {
+    } else if ["qemu", "virtualmachine", "vmmem", "vmware", "virtualbox"]
+        .iter()
+        .any(|s| name.contains(s))
+    {
         "가상 기기"
     } else {
         "기타"
@@ -58,13 +74,39 @@ fn role(name: &str, args: &str) -> String {
     .into()
 }
 fn project(text: &str) -> String {
-    text.split("/Project/")
-        .nth(1)
-        .and_then(|s| s.split(['/', ' ', '\n']).next())
-        .unwrap_or("")
-        .to_string()
+    let normalized = text.replace('\\', "/");
+    // ASCII markers must preserve byte offsets into the original Unicode path.
+    let lower = normalized.to_ascii_lowercase();
+    for marker in [
+        "/project/",
+        "/projects/",
+        "/repos/",
+        "/source/repos/",
+        "/documents/codex/",
+    ] {
+        if let Some(index) = lower.find(marker) {
+            let tail = &normalized[index + marker.len()..];
+            let mut parts = tail.split(['/', ' ', '\n', '"']).filter(|s| !s.is_empty());
+            if let Some(first) = parts.next() {
+                if marker == "/documents/codex/"
+                    && first.len() == 10
+                    && first.as_bytes().get(4) == Some(&b'-')
+                {
+                    return parts
+                        .next()
+                        .map(|second| format!("{first}/{second}"))
+                        .unwrap_or_else(|| first.into());
+                }
+                return first.into();
+            }
+        }
+    }
+    String::new()
 }
 fn rows(system: &System) -> Vec<Row> {
+    let current_user = system
+        .process(Pid::from_u32(std::process::id()))
+        .and_then(|p| p.user_id());
     system
         .processes()
         .values()
@@ -96,14 +138,48 @@ fn rows(system: &System) -> Vec<Row> {
                 seconds: p.run_time(),
                 owned: p
                     .user_id()
-                    .map(|u| **u == unsafe { libc::geteuid() })
+                    .map(|u| current_user.is_some_and(|me| u == me))
                     .unwrap_or(false),
             }
         })
         .collect()
 }
+fn windows_system_process(row: &Row) -> bool {
+    if !cfg!(windows) {
+        return false;
+    }
+    let name = row.name.to_lowercase();
+    let exe = row.exe.replace('\\', "/").to_lowercase();
+    let root = std::env::var("SystemRoot")
+        .unwrap_or_else(|_| "C:\\Windows".into())
+        .replace('\\', "/")
+        .to_lowercase();
+    exe.starts_with(&(root + "/"))
+        || [
+            "system",
+            "registry",
+            "memory compression",
+            "smss.exe",
+            "csrss.exe",
+            "wininit.exe",
+            "winlogon.exe",
+            "services.exe",
+            "lsass.exe",
+            "svchost.exe",
+            "dwm.exe",
+            "explorer.exe",
+            "sihost.exe",
+            "fontdrvhost.exe",
+            "securityhealthservice.exe",
+            "msmpeng.exe",
+            "shellexperiencehost.exe",
+            "startmenuexperiencehost.exe",
+        ]
+        .contains(&name.as_str())
+}
 fn protected(row: &Row, ancestors: &HashSet<u32>) -> bool {
-    row.pid <= 1
+    (row.pid <= 1 || (cfg!(windows) && row.pid <= 4))
+        || windows_system_process(row)
         || !row.owned
         || row.start == 0
         || row.exe.is_empty()
@@ -150,7 +226,11 @@ fn terminate(target: &Row) -> Result<String, String> {
     let p = s
         .process(Pid::from_u32(target.pid))
         .ok_or("프로세스 없음")?;
-    if p.kill_with(Signal::Term) != Some(true) {
+    #[cfg(windows)]
+    let terminated = p.kill();
+    #[cfg(unix)]
+    let terminated = p.kill_with(Signal::Term) == Some(true);
+    if !terminated {
         return Err("종료 요청 실패: 권한 또는 프로세스 상태를 확인해 줘".into());
     }
     for _ in 0..8 {
@@ -179,6 +259,7 @@ fn worker(tx: mpsc::Sender<Event>, rx: mpsc::Receiver<Request>) {
                 rows: rows(&s),
                 total: s.total_memory(),
                 used: s.used_memory(),
+                available: s.available_memory(),
                 swap: s.used_swap(),
             }))
             .is_err()
@@ -222,7 +303,15 @@ struct App {
 impl App {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let mut fonts = egui::FontDefinitions::default();
-        if let Ok(bytes) = std::fs::read("/System/Library/Fonts/AppleSDGothicNeo.ttc") {
+        let font_path = if cfg!(windows) {
+            std::path::PathBuf::from(
+                std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".into()),
+            )
+            .join("Fonts/malgun.ttf")
+        } else {
+            std::path::PathBuf::from("/System/Library/Fonts/AppleSDGothicNeo.ttc")
+        };
+        if let Ok(bytes) = std::fs::read(font_path) {
             fonts
                 .font_data
                 .insert("korean".into(), egui::FontData::from_owned(bytes).into());
@@ -257,7 +346,7 @@ impl App {
             message: "프로세스를 불러오는 중…".into(),
             sort: Sort::Memory,
             charts: true,
-            group_project: true,
+            group_project: false,
         }
     }
 }
@@ -286,7 +375,11 @@ impl Sort {
 fn importance(r: &Row, guards: &HashSet<u32>) -> (u8, &'static str, &'static str) {
     if protected(r, guards) {
         (2, "보호", "시스템·다른 사용자·현재 앱 또는 신원 확인 불가")
-    } else if r.role == "에이전트" || r.role == "가상 기기" || r.parent == 1 || r.cpu > 10.
+    } else if r.role == "에이전트"
+        || r.role == "로컬 LLM"
+        || r.role == "가상 기기"
+        || r.parent == 1
+        || r.cpu > 10.
     {
         (
             1,
@@ -345,7 +438,9 @@ impl eframe::App for App {
                         .retain(|_, r| s.rows.iter().any(|x| same_identity(x, r)));
                     self.snapshot = s;
                     if self.message == "프로세스를 불러오는 중…" {
-                        self.message = "3초마다 갱신 · 메모리는 현재 RSS 기준".into()
+                        self.message =
+                            "3초마다 갱신 · 프로세스 메모리는 작업 집합/RSS · 공유 메모리 중복 가능"
+                                .into()
                     }
                 }
                 Event::Message(m) => self.message = m,
@@ -375,7 +470,9 @@ impl eframe::App for App {
                     gib(self.snapshot.total)
                 ));
                 ui.separator();
-                ui.label(format!("스왑 {}", gib(self.snapshot.swap)));
+                ui.label(format!("사용 가능 {}", gib(self.snapshot.available)));
+                ui.separator();
+                ui.label(format!("스왑/페이지파일 {}", gib(self.snapshot.swap)));
             });
             ui.add_space(6.);
             ui.add(
@@ -399,6 +496,7 @@ impl eframe::App for App {
                 for category in [
                     "전체",
                     "에이전트",
+                    "로컬 LLM",
                     "MCP 도구",
                     "개발 도구",
                     "브라우저",
@@ -420,7 +518,7 @@ impl eframe::App for App {
                 ui.separator();
                 ui.label("이름·PID·프로젝트로 검색");
                 ui.add_space(10.);
-                ui.small("부모가 1이어도 상시 서비스일 수 있어.");
+                ui.small("일반 표시는 종료 추천이 아니야. 사용 중인 작업을 먼저 확인해 줘.");
             });
         egui::SidePanel::right("inspector").exact_width(270.).show(ctx,|ui|{
         ui.add_space(10.);ui.heading("프로세스 상세");
@@ -514,7 +612,7 @@ impl eframe::App for App {
                 }
             });
             ui.small(
-                "체크박스 또는 ⌘ 클릭 · Shift 클릭으로 범위 선택 · 선택은 필터를 바꿔도 유지돼.",
+                "체크박스 또는 Ctrl/⌘ 클릭 · Shift 클릭으로 범위 선택 · 선택은 필터를 바꿔도 유지돼.",
             );
             if self.group_project {
                 ui.small("정렬은 각 프로젝트 안에 적용돼. 전체 정렬은 프로젝트별을 꺼 줘.");
@@ -544,7 +642,7 @@ impl eframe::App for App {
                         if points.len() > 1 {
                             painter.add(egui::Shape::line(
                                 points,
-                                egui::Stroke::new(2., egui::Color32::from_rgb(40, 130, 190)),
+                                egui::Stroke::new(2_f32, egui::Color32::from_rgb(40, 130, 190)),
                             ));
                         }
                         let mut top = visible.clone();
@@ -697,7 +795,11 @@ impl eframe::App for App {
                             }
                         });
                     ui.label("저장하지 않은 작업이 사라질 수 있어.");
-                    ui.label("정상 종료 요청(SIGTERM)을 보내며 자동실행 설정은 바꾸지 않아.");
+                    ui.label(if cfg!(windows) {
+                        "Windows 강제 종료(taskkill /F). 먼저 앱에서 정상 종료하는 것을 권장해."
+                    } else {
+                        "정상 종료 요청(SIGTERM)을 보내며 자동실행 설정은 바꾸지 않아."
+                    });
                     ui.horizontal(|ui| {
                         if ui.button("취소").clicked() {
                             self.confirm = None
@@ -718,6 +820,33 @@ impl eframe::App for App {
     }
 }
 fn main() -> eframe::Result {
+    if let Some(path) = std::env::args()
+        .skip(1)
+        .find_map(|a| a.strip_prefix("--diagnostics=").map(str::to_owned))
+    {
+        let mut system = System::new_all();
+        thread::sleep(Duration::from_secs(1));
+        system.refresh_all();
+        let data = rows(&system);
+        let own = data.iter().filter(|r| r.owned).count();
+        let protected_count = data
+            .iter()
+            .filter(|r| protected(r, &ancestors(&system)))
+            .count();
+        std::fs::write(
+            path,
+            format!(
+                "processes={}\nowned={}\nprotected={}\ntotal_bytes={}\navailable_bytes={}\n",
+                data.len(),
+                own,
+                protected_count,
+                system.total_memory(),
+                system.available_memory()
+            ),
+        )
+        .expect("write diagnostics");
+        return Ok(());
+    }
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1180., 760.])
@@ -733,6 +862,24 @@ fn main() -> eframe::Result {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn sleeper() -> std::process::Child {
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--ignored", "--exact", "tests::child_sleep_helper"])
+                .creation_flags(0x08000000)
+                .spawn()
+                .unwrap()
+        }
+        #[cfg(unix)]
+        {
+            std::process::Command::new("/bin/sleep")
+                .arg("60")
+                .spawn()
+                .unwrap()
+        }
+    }
     fn fixture(pid: u32, start: u64) -> Row {
         Row {
             pid,
@@ -747,6 +894,55 @@ mod tests {
             seconds: 0,
             owned: true,
         }
+    }
+    #[test]
+    #[ignore]
+    fn child_sleep_helper() {
+        thread::sleep(Duration::from_secs(60));
+    }
+    #[test]
+    fn windows_roles_and_paths() {
+        assert_eq!(role("chrome.exe", ""), "브라우저");
+        assert_eq!(role("llama-server.exe", ""), "로컬 LLM");
+        assert_eq!(role("node.exe", "mcp server"), "MCP 도구");
+        assert_eq!(
+            project(r"C:\Users\me\Documents\Codex\2026-10-16\app\src"),
+            "2026-10-16/app"
+        );
+        assert_eq!(project(r"D:\Projects\garden\src"), "garden");
+        if cfg!(windows) {
+            let mut r = fixture(100, 10);
+            r.name = "dwm.exe".into();
+            assert!(protected(&r, &HashSet::new()));
+        }
+    }
+    #[test]
+    fn unicode_project_path_preserves_offsets() {
+        // Unicode lowercasing can change the byte length of İ before the marker.
+        assert_eq!(project("/Users/İ/Projects/garden/src"), "garden");
+        assert_eq!(project(r"C:\Users\사용자\PROJECTS\정원\src"), "정원");
+    }
+    #[test]
+    fn unknown_ownership_and_identity_are_protected() {
+        let guards = HashSet::new();
+        let row = fixture(100, 10);
+        assert!(!protected(&row, &guards));
+        let mut changed = row.clone();
+        changed.owned = false;
+        assert!(protected(&changed, &guards));
+        assert!(!same_identity(&row, &changed));
+        changed = row.clone();
+        changed.exe.clear();
+        assert!(protected(&changed, &guards));
+        assert!(!same_identity(&row, &changed));
+        changed = row.clone();
+        changed.start = 0;
+        assert!(protected(&changed, &guards));
+        changed = row.clone();
+        changed.exe = "/System/Library/test".into();
+        assert!(protected(&changed, &guards));
+        changed.exe = "/usr/libexec/test".into();
+        assert!(protected(&changed, &guards));
     }
     #[test]
     fn sorting_range_and_protection() {
@@ -766,14 +962,7 @@ mod tests {
     }
     #[test]
     fn batch_terminates_only_requested_children() {
-        let mut children: Vec<_> = (0..3)
-            .map(|_| {
-                std::process::Command::new("/bin/sleep")
-                    .arg("60")
-                    .spawn()
-                    .unwrap()
-            })
-            .collect();
+        let mut children: Vec<_> = (0..3).map(|_| sleeper()).collect();
         let snapshot = rows(&System::new_all());
         for child in children.iter().take(2) {
             let row = snapshot.iter().find(|r| r.pid == child.id()).unwrap();
@@ -796,10 +985,7 @@ mod tests {
     }
     #[test]
     fn own_child_termination_and_stale_pid_guard() {
-        let mut child = std::process::Command::new("/bin/sleep")
-            .arg("60")
-            .spawn()
-            .unwrap();
+        let mut child = sleeper();
         let s = System::new_all();
         let row = rows(&s).into_iter().find(|r| r.pid == child.id()).unwrap();
         let mut stale = row.clone();

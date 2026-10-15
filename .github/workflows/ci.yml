@@ -1,0 +1,30 @@
+name: Windows and macOS
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-and-build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --check
+      - run: cargo test --locked -- --test-threads=1
+      - run: cargo build --locked --release
+        env:
+          CARGO_BUILD_JOBS: 2
+      - name: Bundle macOS app
+        if: runner.os == 'macOS'
+        run: bash scripts/bundle.sh
