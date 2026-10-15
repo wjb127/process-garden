@@ -6,7 +6,6 @@ edition = "2024"
 [dependencies]
 eframe = { version = "0.33", default-features = false, features = ["glow", "default_fonts"] }
 sysinfo = "0.37"
-libc = "0.2"
 
 [profile.dev]
 debug = 0

@@ -30,6 +30,14 @@ fn gib(n: u64) -> f64 {
     n as f64 / 1073741824.
 }
 fn startup(disks: &[Disk]) -> Option<&Disk> {
+    if cfg!(windows) {
+        let drive = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".into());
+        return disks.iter().find(|d| {
+            d.mount
+                .trim_end_matches(['/', '\\'])
+                .eq_ignore_ascii_case(&drive)
+        });
+    }
     disks
         .iter()
         .find(|d| d.mount == "/System/Volumes/Data")
@@ -203,7 +211,14 @@ mod tests {
             },
             Disk {
                 name: "data".into(),
-                mount: "/System/Volumes/Data".into(),
+                mount: if cfg!(windows) {
+                    format!(
+                        "{}\\",
+                        std::env::var("SystemDrive").unwrap_or_else(|_| "C:".into())
+                    )
+                } else {
+                    "/System/Volumes/Data".into()
+                },
                 total: 200,
                 free: 50,
             },
